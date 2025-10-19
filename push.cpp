@@ -1831,7 +1831,7 @@ long make_curl_request(const CString& service_host, const CString& service_url,
 	{
 		if (param->first.StartsWith("_header_"))
 		{
-			CString header_name = param->first.Mid(8);  // Skip "_header_" prefix
+			CString header_name = param->first.c_str() + 8;  // Skip "_header_" prefix
 			CString header_value = header_name + ": " + param->second;
 			headers = curl_slist_append(headers, header_value.c_str());
 		}
@@ -1947,7 +1947,7 @@ void CPushSocket::Request(bool post, const CString& host, const CString& url, MC
 	{
 		if (param->first.StartsWith("_header_"))
 		{
-			CString header_name = param->first.Mid(8);  // Skip "_header_" prefix
+			CString header_name = param->first.c_str() + 8;  // Skip "_header_" prefix
 			request += header_name + ": " + param->second + crlf;
 			parent->PutDebug(header_name + ": " + param->second);
 		}
