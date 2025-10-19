@@ -160,6 +160,10 @@ class CPushMod : public CModule
 			defaults["proxy"] = "";
 			defaults["proxy_ssl_verify"] = "yes";
 
+			// ntfy.sh support
+			defaults["ntfy_host"] = "";
+			defaults["ntfy_tags"] = "";
+
 			// Advanced
 			defaults["channel_conditions"] = "all";
 			defaults["query_conditions"] = "all";
@@ -590,6 +594,49 @@ class CPushMod : public CModule
 				if (options["message_escape"] == "HTML") {
 					params["parse_mode"] = "HTML";
 				}
+			}
+			else if (service == "ntfy")
+			{
+				if (options["ntfy_host"] == "")
+				{
+					PutModule("Error: ntfy_host not set");
+					return;
+				}
+				if (options["target"] == "")
+				{
+					PutModule("Error: target (channel or username) not set");
+					return;
+				}
+
+				service_host = options["ntfy_host"];
+				service_url = "/" + options["target"];
+
+				// ntfy uses HTTP headers for metadata, so we'll use special params prefixed with _header_
+				CString ntfy_title = expand(options["message_title"], replace);
+				CString ntfy_priority = expand(options["message_priority"], replace);
+				CString ntfy_tags = expand(options["ntfy_tags"], replace);
+
+				params["_header_Title"] = ntfy_title;
+				if (ntfy_priority != "" && ntfy_priority != "0")
+				{
+					params["_header_Priority"] = ntfy_priority;
+				}
+				if (ntfy_tags != "")
+				{
+					params["_header_Tags"] = ntfy_tags;
+				}
+
+				// Add Bearer token authentication if secret is set
+				if (options["secret"] != "")
+				{
+					params["_header_Authorization"] = "Bearer " + options["secret"];
+				}
+
+				// For ntfy, the message content goes in the body, not as form parameters
+				params["_body_"] = message_content;
+
+				// Use POST method for ntfy
+				use_post = true;
 			}
 			else
 			{
@@ -1352,6 +1399,11 @@ class CPushMod : public CModule
 						{
 							PutModule("Note: Telegram requires setting both the 'secret' (api key) and 'target' (chat_id)");
 						}
+						else if (value == "ntfy")
+						{
+							PutModule("Note: ntfy requires setting both 'ntfy_host' (ntfy server address) and 'target' (topic name)");
+							PutModule("Note: Optional 'secret' (Bearer token), 'message_priority' (priority), 'message_title' (title), 'ntfy_tags' (tags)");
+						}
 						else
 						{
 							PutModule("Error: unknown service name");
@@ -1669,9 +1721,9 @@ class CPushMod : public CModule
 };
 
 /**
- * Build a query string from a dictionary of request parameters.
+ * Build a query string from parameters.
  *
- * @param params Request parameters
+ * @param params Parameters map
  * @return query string
  */
 CString build_query_string(MCString& params)
@@ -1682,6 +1734,18 @@ CString build_query_string(MCString& params)
 	CString value;
 	for (MCString::iterator param = params.begin(); param != params.end(); param++)
 	{
+		// Skip header parameters - they're handled separately
+		if (param->first.StartsWith("_header_"))
+		{
+			continue;
+		}
+
+		// Skip body parameter - it's handled separately
+		if (param->first == "_body_")
+		{
+			continue;
+		}
+
 		key = urlencode(param->first);
 		value = urlencode(param->second);
 
@@ -1726,8 +1790,18 @@ long make_curl_request(const CString& service_host, const CString& service_url,
 	CString user_agent = "ZNC Push/" + CString(PUSHVERSION);
 
 	CString url = CString(use_ssl ? "https" : "http") + "://" + service_host + service_url;
+
+	// Check if we have a raw body parameter
+	CString body;
+	MCString::iterator body_param = params.find("_body_");
+	bool has_body = body_param != params.end();
+	if (has_body)
+	{
+		body = body_param->second;
+	}
+
 	CString query = build_query_string(params);
-	if (!query.empty())
+	if (!query.empty() && !has_body)
 	{
 		url = url + "?" + query;
 	}
@@ -1751,11 +1825,36 @@ long make_curl_request(const CString& service_host, const CString& service_url,
 		curl_easy_setopt(curl, CURLOPT_USERPWD, service_auth.data());
 	}
 
+	// Add custom headers from parameters prefixed with _header_
+	struct curl_slist *headers = nullptr;
+	for (MCString::iterator param = params.begin(); param != params.end(); param++)
+	{
+		if (param->first.StartsWith("_header_"))
+		{
+			CString header_name = param->first.Mid(8);  // Skip "_header_" prefix
+			CString header_value = header_name + ": " + param->second;
+			headers = curl_slist_append(headers, header_value.c_str());
+		}
+	}
+	if (headers != nullptr)
+	{
+		curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+	}
+
 	if (use_post)
 	{
 		curl_easy_setopt(curl, CURLOPT_POST, 1);
-		curl_easy_setopt(curl, CURLOPT_POSTFIELDS, query.data());
-		curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, query.length());
+		if (has_body)
+		{
+			// Raw body content
+			curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.data());
+			curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, body.length());
+		}
+		else
+		{
+			curl_easy_setopt(curl, CURLOPT_POSTFIELDS, query.data());
+			curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, query.length());
+		}
 	}
 
 	if (proxy != "") {
@@ -1767,6 +1866,10 @@ long make_curl_request(const CString& service_host, const CString& service_url,
 	}
 
 	result = curl_easy_perform(curl);
+	if (headers != nullptr)
+	{
+		curl_slist_free_all(headers);
+	}
 	if (result != CURLE_OK) {
 		curl_easy_cleanup(curl);
 		return -1;
@@ -1793,6 +1896,15 @@ void CPushSocket::Request(bool post, const CString& host, const CString& url, MC
 {
 	parent->PutDebug("Building notification to " + host + url + "...");
 
+	// Check if we have a raw body parameter
+	CString body;
+	MCString::iterator body_param = parameters.find("_body_");
+	bool has_body = body_param != parameters.end();
+	if (has_body)
+	{
+		body = body_param->second;
+	}
+
 	CString query = build_query_string(parameters);
 
 	// Request headers and POST body
@@ -1801,8 +1913,17 @@ void CPushSocket::Request(bool post, const CString& host, const CString& url, MC
 	if (post)
 	{
 		request += "POST " + url + " HTTP/1.1" + crlf;
-		request += "Content-Type: application/x-www-form-urlencoded" + crlf;
-		request += "Content-Length: " + CString(query.length()) + crlf;
+		if (has_body)
+		{
+			// Raw body content
+			request += "Content-Type: text/plain" + crlf;
+			request += "Content-Length: " + CString(body.length()) + crlf;
+		}
+		else
+		{
+			request += "Content-Type: application/x-www-form-urlencoded" + crlf;
+			request += "Content-Length: " + CString(query.length()) + crlf;
+		}
 	}
 	else
 	{
@@ -1821,11 +1942,29 @@ void CPushSocket::Request(bool post, const CString& host, const CString& url, MC
 		parent->PutDebug("Authorization: Basic " + auth_b64);
 	}
 
+	// Add custom headers from parameters prefixed with _header_
+	for (MCString::iterator param = parameters.begin(); param != parameters.end(); param++)
+	{
+		if (param->first.StartsWith("_header_"))
+		{
+			CString header_name = param->first.Mid(8);  // Skip "_header_" prefix
+			request += header_name + ": " + param->second + crlf;
+			parent->PutDebug(header_name + ": " + param->second);
+		}
+	}
+
 	request += crlf;
 
 	if (post)
 	{
-		request += query;
+		if (has_body)
+		{
+			request += body;
+		}
+		else
+		{
+			request += query;
+		}
 	}
 
 	parent->PutDebug("Query string: " + query);
